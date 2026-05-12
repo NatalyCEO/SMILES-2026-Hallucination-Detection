@@ -38,7 +38,13 @@ Hallucination Detection in Small Language Models
 
 """
 
+import gc
+import os
 import time
+
+# Stabilise long CPU runs (OpenMP/MKL + allocator fragmentation).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -47,7 +53,7 @@ from tqdm import tqdm
 
 from aggregation import aggregation_and_feature_extraction
 from evaluate import print_summary, run_evaluation, save_predictions, save_results
-from model import MAX_LENGTH, get_model_and_tokenizer
+from model import MAX_LENGTH, _DEFAULT_MODEL
 from probe import HallucinationProbe
 from splitting import split_data
 
@@ -55,13 +61,14 @@ from splitting import split_data
 
 DATA_FILE     = "./data/dataset.csv"   # path to the dataset CSV
 OUTPUT_FILE   = "results.json"         # where to write the results summary
-BATCH_SIZE    = 4
+BATCH_SIZE    = 1  # smaller batches reduce peak RAM (lm_head logits scale with batch size)
 USE_GEOMETRIC = False                  # set True to enable geometric feature extraction
 TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
 PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
 
 assert OUTPUT_FILE == "results.json"
 assert PREDICTIONS_FILE == "predictions.csv"
+
 # ---------------------------------------------------------------------
 if __name__=='__main__':
     if torch.cuda.is_available():
@@ -70,6 +77,28 @@ if __name__=='__main__':
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+
+    torch.set_num_threads(1)
+
+    def load_llm():
+        """Load like model.get_model_and_tokenizer; CPU uses float32 + stable attention (Win)."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print(f"[Model] Loading '{_DEFAULT_MODEL}' ...")
+        tokenizer = AutoTokenizer.from_pretrained(_DEFAULT_MODEL)
+        dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+        extra = {}
+        if device.type == "cpu":
+            extra["low_cpu_mem_usage"] = True
+            extra["attn_implementation"] = "eager"
+        m = AutoModelForCausalLM.from_pretrained(
+            _DEFAULT_MODEL,
+            output_hidden_states=True,
+            dtype=dtype,
+            **extra,
+        )
+        m.eval()
+        return m, tokenizer
 
     print(f"Device       : {device}")
     print(f"Data         : {DATA_FILE}")
@@ -105,19 +134,20 @@ if __name__=='__main__':
     print(f"── label : {int(row0['label'])}  ({label_str})")
 
 
-    # Load the LLM
-    model, tokenizer = get_model_and_tokenizer()
+    # ── Train features (in memory only; no disk checkpoints) ────────────────
+    model, tokenizer = load_llm()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
-    all_features: list = []
-    t0 = time.time()
+    t0_extract = time.time()
+    pending_blocks: list[np.ndarray] = []
 
-    for start in tqdm(range(0, len(all_texts), BATCH_SIZE),
-                    desc="Extracting & aggregating", unit="batch"):
-
-        # ── 1. Tokenise the current mini-batch ───────────────────────────────
+    for start in tqdm(
+        range(0, len(all_texts), BATCH_SIZE),
+        desc="Extracting & aggregating",
+        unit="batch",
+    ):
         batch_texts = all_texts[start : start + BATCH_SIZE]
         encoding = tokenizer(
             batch_texts,
@@ -126,37 +156,46 @@ if __name__=='__main__':
             truncation=True,
             max_length=MAX_LENGTH,
         )
-        input_ids      = encoding["input_ids"].to(device)
+        input_ids = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
 
-        # ── 2. LLM forward pass ──────────────────────────────────────────────
-        # outputs.hidden_states: tuple of (n_layers+1) tensors,
-        # each with shape (batch, seq_len, hidden_dim).
-        # Index 0 → token embeddings; index k → transformer layer k.
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
-        # Shape: (batch, n_layers, seq_len, hidden_dim)
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        mask = attention_mask.cpu()
 
-        # ── 4. Aggregate each sample and store the compact feature vector ─────
-        # The raw `hidden` tensor is released at the end of this loop iteration.
-        for i in range(hidden.size(0)):
-            feat = aggregation_and_feature_extraction(
-                hidden[i],   # (n_layers, seq_len, hidden_dim)
-                mask[i],     # (seq_len,)
-                use_geometric=USE_GEOMETRIC,
-            )
-            all_features.append(feat.cpu())
+        batch_mat = np.vstack(
+            [
+                aggregation_and_feature_extraction(
+                    hidden[i],
+                    mask[i],
+                    use_geometric=USE_GEOMETRIC,
+                )
+                .cpu()
+                .numpy()
+                for i in range(hidden.size(0))
+            ]
+        )
+        pending_blocks.append(batch_mat)
 
-    extract_time = time.time() - t0
-    print(f"Done in {extract_time:.1f} s  —  {len(all_features)} feature vectors extracted")
+        del outputs, hidden, input_ids, attention_mask, encoding
+        gc.collect()
 
-    # Stack into the (N, feature_dim) matrix used by the probe.
-    X = np.vstack([f.numpy() for f in all_features])   # shape: (N, feature_dim)
-    y = all_labels                                       # shape: (N,)
+    extract_time = time.time() - t0_extract
+    X = np.vstack(pending_blocks)
+    print(
+        f"Train extraction done in {extract_time:.1f} s — "
+        f"{X.shape[0]} × {X.shape[1]}"
+    )
+
+    del model, tokenizer
+    model, tokenizer = None, None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    y = all_labels
 
     print(f"Feature matrix : {X.shape}  (feature_dim = {X.shape[1]})")
     print(f"Geometric feats: {USE_GEOMETRIC}")
@@ -179,14 +218,21 @@ if __name__=='__main__':
     df_test    = pd.read_csv(TEST_FILE)
     test_texts = [f"{row['prompt']}{row['response']}" for _, row in df_test.iterrows()]
     test_ids   = df_test.index
-    print(f"Test set loaded: {len(test_texts)} samples")
+    n_test = len(test_texts)
+    print(f"Test set loaded: {n_test} samples")
 
-    # ── Extract features for test set (same loop as Section 4) ───────────────
-    test_features: list = []
+    # ── Test features (in memory only) ──────────────────────────────────────
+    model, tokenizer = load_llm()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model.to(device)
 
-    for start in tqdm(range(0, len(test_texts), BATCH_SIZE),
-                    desc="Test extraction & aggregation", unit="batch"):
-
+    test_blocks: list[np.ndarray] = []
+    for start in tqdm(
+        range(0, n_test, BATCH_SIZE),
+        desc="Test extraction & aggregation",
+        unit="batch",
+    ):
         batch_texts = test_texts[start : start + BATCH_SIZE]
         encoding = tokenizer(
             batch_texts,
@@ -195,22 +241,35 @@ if __name__=='__main__':
             truncation=True,
             max_length=MAX_LENGTH,
         )
-        input_ids      = encoding["input_ids"].to(device)
+        input_ids = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
 
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        mask = attention_mask.cpu()
 
-        for i in range(hidden.size(0)):
-            feat = aggregation_and_feature_extraction(
-                hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
-            )
-            test_features.append(feat.cpu())
+        batch_mat = np.vstack(
+            [
+                aggregation_and_feature_extraction(
+                    hidden[i], mask[i], use_geometric=USE_GEOMETRIC
+                )
+                .cpu()
+                .numpy()
+                for i in range(hidden.size(0))
+            ]
+        )
+        test_blocks.append(batch_mat)
 
-    X_test = np.vstack([f.numpy() for f in test_features])  # (n_test, feature_dim)
+        del outputs, hidden, input_ids, attention_mask, encoding
+        gc.collect()
+
+    X_test = np.vstack(test_blocks)
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ── Fit final probe on training + validation data only ──────────────────
     # Collect the union of all train and validation indices across every split.

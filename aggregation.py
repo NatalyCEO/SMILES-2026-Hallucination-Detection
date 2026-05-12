@@ -20,6 +20,10 @@ from __future__ import annotations
 import torch
 
 
+def _l2_normalize(vec: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return vec / vec.norm(p=2).clamp(min=eps)
+
+
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -41,21 +45,80 @@ def aggregate(
         Replace or extend the skeleton below with alternative layer selection,
         token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    # Layer 0 = embeddings; transformer layers are indices 1 .. n_layers-1.
+    dev = hidden_states.device
+    attention_mask = attention_mask.to(dev)
+    n_layers = hidden_states.size(0)
+    seq_len = int(attention_mask.sum().item())
+    nz = attention_mask.nonzero(as_tuple=False)
+    real_positions = nz.squeeze(-1) if nz.dim() > 1 else nz
+    last_pos = int(real_positions[-1].item())
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    tr_layers = list(range(1, n_layers))
+    idx_pick = [
+        tr_layers[len(tr_layers) // 6],
+        tr_layers[len(tr_layers) // 3],
+        tr_layers[len(tr_layers) // 2],
+        tr_layers[2 * len(tr_layers) // 3],
+        tr_layers[-1],
+    ]
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    # L2-normalise multi-layer last-token vectors so shallow/deep scales match.
+    last_token_feats = [
+        _l2_normalize(hidden_states[i, last_pos].float()) for i in idx_pick
+    ]
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    final_layer = hidden_states[-1].float()
+    mask_f = attention_mask.float().unsqueeze(-1)
+    denom = mask_f.sum().clamp(min=1.0)
+    mean_seq = (final_layer * mask_f).sum(dim=0) / denom
 
-    return feature
-    # ------------------------------------------------------------------
+    # Exponential position weights emphasise the tail (assistant reply region).
+    full_len = hidden_states.size(1)
+    pos_idx = torch.arange(full_len, device=dev, dtype=torch.float32)
+    tail_w = torch.exp(3.5 * pos_idx / max(full_len - 1, 1)) * attention_mask.float()
+    tail_w = tail_w / tail_w.sum().clamp(min=1e-12)
+    weighted_mean = (final_layer * tail_w.unsqueeze(-1)).sum(dim=0)
+
+    # Mean over late sequence only — ответ ассистента обычно в последних токенах.
+    n_real = len(real_positions)
+    cut = max(0, int(0.70 * n_real))
+    suffix_idx = real_positions[cut:]
+    if suffix_idx.numel() > 0:
+        suffix_mean = final_layer[suffix_idx].mean(dim=0)
+    else:
+        suffix_mean = final_layer[last_pos].clone()
+
+    centered = final_layer - mean_seq.unsqueeze(0)
+    std_seq = torch.sqrt((centered.pow(2) * mask_f).sum(dim=0) / denom)
+
+    # Window over last few tokens (short answers stay informative).
+    win = min(48, len(real_positions))
+    win_idx = real_positions[-win:]
+    tail_window_mean = final_layer[win_idx].mean(dim=0)
+
+    lt = final_layer[last_pos]
+    contrast = lt - mean_seq
+    contrast_w = lt - weighted_mean
+    cos_lm = (lt * mean_seq).sum() / (lt.norm(p=2) * mean_seq.norm(p=2)).clamp(min=1e-12)
+    scalars = torch.tensor(
+        [cos_lm.item(), float(seq_len) / 512.0],
+        device=dev,
+        dtype=torch.float32,
+    )
+
+    parts: list[torch.Tensor] = [
+        *last_token_feats,
+        mean_seq,
+        weighted_mean,
+        suffix_mean,
+        std_seq,
+        tail_window_mean,
+        contrast,
+        contrast_w,
+        scalars,
+    ]
+    return torch.cat(parts, dim=0)
 
 
 def extract_geometric_features(
@@ -81,12 +144,14 @@ def extract_geometric_features(
         norms, inter-layer cosine similarity (representation drift), or
         sequence length.
     """
+    attention_mask = attention_mask.to(hidden_states.device)
+
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the geometric feature extraction below.
     # ------------------------------------------------------------------
 
     # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    return torch.zeros(0, device=hidden_states.device, dtype=torch.float32)
 
 
 def aggregation_and_feature_extraction(

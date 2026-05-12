@@ -13,166 +13,238 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 
 class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
+    """Binary classifier: StandardScaler → PCA → linear logistic probe.
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    PCA dimension and ``C`` are chosen by **validation AUROC** when
+    ``fit_hyperparameters`` runs after ``fit`` (k-fold evaluation).
+
+    When only ``fit`` is called (final ``solution.py`` fit on train∪val),
+    the same grid is scored with **stratified inner CV** (mean AUROC across
+    folds), then refit on all samples.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
+        self._net: nn.Linear | None = None
+        self._pca: PCA | None = None
         self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._threshold: float = 0.5
 
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
+        self._X_train: np.ndarray | None = None
+        self._y_train: np.ndarray | None = None
+
     def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
-
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
-
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
-    # ------------------------------------------------------------------
+        self._net = nn.Linear(input_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
         if self._net is None:
             raise RuntimeError(
                 "Network has not been built yet. Call fit() before forward()."
             )
         return self._net(x).squeeze(-1)
 
+    def _max_pca_components(self, n_samples: int, n_features: int) -> int:
+        return int(min(max(n_samples - 1, 1), n_features, 512))
+
+    def _pca_component_grid(self, n_samples: int, n_features: int) -> list[int]:
+        cap = self._max_pca_components(n_samples, n_features)
+        raw = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384]
+        out = [k for k in raw if 8 <= k <= cap]
+        if not out:
+            out = [min(cap, 8)]
+        return sorted(set(out))
+
+    def _c_grid(self) -> np.ndarray:
+        return np.logspace(-2.25, 0.35, 10)
+
+    def _logistic(self, C: float) -> LogisticRegression:
+        return LogisticRegression(
+            C=float(C),
+            solver="lbfgs",
+            max_iter=8000,
+            class_weight="balanced",
+            tol=1e-4,
+            random_state=42,
+        )
+
+    def _copy_lr_to_linear(self, clf: LogisticRegression, input_dim: int) -> None:
+        self._build_network(input_dim)
+        coef = torch.from_numpy(clf.coef_.astype(np.float32))
+        bias = torch.from_numpy(clf.intercept_.astype(np.float32))
+        with torch.no_grad():
+            self._net.weight.copy_(coef)
+            self._net.bias.copy_(bias)
+
+    def _fit_pca_lr_refit(
+        self,
+        X_scaled_train: np.ndarray,
+        y: np.ndarray,
+        n_components: int,
+        C: float,
+    ) -> tuple[PCA, LogisticRegression]:
+        pca = PCA(n_components=n_components, random_state=42, svd_solver="full")
+        Xp = pca.fit_transform(X_scaled_train)
+        clf = self._logistic(C)
+        clf.fit(Xp, y)
+        return pca, clf
+
+    def _select_and_fit_with_validation(
+        self,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> None:
+        assert self._X_train is not None and self._y_train is not None
+        Xs = self._scaler.transform(self._X_train)
+        y = self._y_train
+        Xvs = self._scaler.transform(X_val)
+        n_samples, n_features = Xs.shape
+
+        best_auc = -1.0
+        best_n: int | None = None
+        best_c: float | None = None
+
+        for n_comp in self._pca_component_grid(n_samples, n_features):
+            for C in self._c_grid():
+                pca = PCA(n_components=n_comp, random_state=42, svd_solver="full")
+                try:
+                    Xp = pca.fit_transform(Xs)
+                    Xpv = pca.transform(Xvs)
+                except Exception:
+                    continue
+                clf = self._logistic(C)
+                clf.fit(Xp, y)
+                probs = clf.predict_proba(Xpv)[:, 1]
+                try:
+                    auc = roc_auc_score(y_val, probs)
+                except ValueError:
+                    continue
+                if auc > best_auc:
+                    best_auc = auc
+                    best_n = n_comp
+                    best_c = float(C)
+
+        if best_n is None or best_c is None:
+            best_n = min(128, self._max_pca_components(n_samples, n_features))
+            best_c = 0.1
+
+        pca, clf = self._fit_pca_lr_refit(Xs, y, best_n, best_c)
+        self._pca = pca
+        self._copy_lr_to_linear(clf, best_n)
+        self.eval()
+
+    def _select_and_fit_inner_cv(self) -> None:
+        assert self._X_train is not None and self._y_train is not None
+        Xs = self._scaler.transform(self._X_train)
+        y = self._y_train
+        n_samples, n_features = Xs.shape
+
+        n_splits = min(5, max(2, n_samples // 40))
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        best_mean = -1.0
+        best_n: int | None = None
+        best_c: float | None = None
+
+        for n_comp in self._pca_component_grid(n_samples, n_features):
+            for C in self._c_grid():
+                fold_aucs: list[float] = []
+                for tr_idx, va_idx in skf.split(Xs, y):
+                    X_tr, X_va = Xs[tr_idx], Xs[va_idx]
+                    y_tr, y_va = y[tr_idx], y[va_idx]
+                    pca = PCA(n_components=n_comp, random_state=42, svd_solver="full")
+                    try:
+                        Xptr = pca.fit_transform(X_tr)
+                        Xpva = pca.transform(X_va)
+                    except Exception:
+                        fold_aucs = []
+                        break
+                    clf = self._logistic(C)
+                    clf.fit(Xptr, y_tr)
+                    probs = clf.predict_proba(Xpva)[:, 1]
+                    try:
+                        fold_aucs.append(roc_auc_score(y_va, probs))
+                    except ValueError:
+                        pass
+                if len(fold_aucs) < n_splits:
+                    continue
+                m = float(np.mean(fold_aucs))
+                if m > best_mean:
+                    best_mean = m
+                    best_n = n_comp
+                    best_c = float(C)
+
+        if best_n is None or best_c is None:
+            best_n = min(128, self._max_pca_components(n_samples, n_features))
+            best_c = 0.1
+
+        pca, clf = self._fit_pca_lr_refit(Xs, y, best_n, best_c)
+        self._pca = pca
+        self._copy_lr_to_linear(clf, best_n)
+        self.eval()
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
-
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
-        X_scaled = self._scaler.fit_transform(X)
-
-        self._build_network(X_scaled.shape[1])
-
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
+        """Fit scaler and cache training data; PCA/LR are fit later."""
+        self._X_train = np.asarray(X, dtype=np.float64)
+        self._y_train = np.asarray(y, dtype=np.int64)
+        self._scaler.fit(self._X_train)
+        self._pca = None
+        self._net = None
         self.eval()
         return self
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
+        """Pick PCA dim + C by validation AUROC; tune threshold on validation accuracy."""
+        self._select_and_fit_with_validation(
+            np.asarray(X_val, dtype=np.float64),
+            np.asarray(y_val, dtype=np.int64),
+        )
 
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
         probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
+        candidates = np.unique(
+            np.concatenate([probs, np.linspace(0.0, 1.0, 501)])
+        )
 
         best_threshold = 0.5
-        best_f1 = -1.0
+        best_acc = -1.0
+        best_bal = -1.0
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
+            acc = accuracy_score(y_val, y_pred_t)
+            bal = balanced_accuracy_score(y_val, y_pred_t)
+            if acc > best_acc or (
+                np.isclose(acc, best_acc) and bal > best_bal
+            ):
+                best_acc = acc
+                best_bal = bal
                 best_threshold = float(t)
 
         self._threshold = best_threshold
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
+        if self._net is None or self._pca is None:
+            if self._X_train is None:
+                raise RuntimeError("Call fit() before predict_proba().")
+            self._select_and_fit_inner_cv()
 
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
-        """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
+        assert self._pca is not None and self._net is not None
+        X_scaled = self._scaler.transform(np.asarray(X, dtype=np.float64))
+        X_pca = self._pca.transform(X_scaled).astype(np.float32)
+        X_t = torch.from_numpy(X_pca)
         with torch.no_grad():
             logits = self(X_t)
             prob_pos = torch.sigmoid(logits).numpy()
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
