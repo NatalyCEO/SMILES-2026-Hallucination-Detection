@@ -1,4 +1,4 @@
-#Solution Report
+# Solution Report
 
 ## 1. Reproducibility
 
@@ -52,7 +52,7 @@ Running `solution.py` must produce:
 
 2. **`agregation.py`,`probe.py` and `splitting.py`**  
    - `aggregation.py` — multi-layer + pooled features.  
-   - `probe.py` — `StandardScaler` → **PCA** → linear logistic probe; **PCA dimension and `C`** chosen by **validation AUROC** on each outer fold (grid search); **threshold** tuned on **validation accuracy** (tie-break balanced accuracy). Final fit on all train∪val indices uses **inner CV mean AUROC** to pick PCA/`C` before refitting on full data.  
+   - `probe.py` — `StandardScaler` → **PCA** → linear logistic probe; **PCA dimension and C** chosen by **validation AUROC** on each outer fold (grid search); **threshold** tuned on **validation accuracy** (tie-break balanced accuracy). Final fit on all train∪val indices uses **inner CV mean AUROC** to pick PCA/C before refitting on full data.  
    - `splitting.py` — stratified **5-fold** CV for evaluation; final probe is fit on all non-test indices united across folds (as in `solution.py`).
 
 Random seeds: `splitting.split_data(..., random_state=42)`, `sklearn` components in `probe.py` use `random_state=42` where applicable.
@@ -84,19 +84,19 @@ Random seeds: `splitting.split_data(..., random_state=42)`, `sklearn` components
 2. **Probe (`HallucinationProbe`)**  
    - `StandardScaler` on inputs.  
    - **PCA** on scaled features (dimension from a fixed candidate grid, capped by sample count).  
-   - **Logistic regression** on PCA coordinates: `sklearn.linear_model.LogisticRegression` (`class_weight="balanced"`, L-BFGS); **`C`** comes from a **log-spaced grid**, not a single constant. Weights are copied into one `nn.Linear` for `forward` / `predict_proba`.  
+   - **Logistic regression** on PCA coordinates: `sklearn.linear_model.LogisticRegression` (`class_weight="balanced"`, L-BFGS); **C** comes from a **log-spaced grid**, not a single constant. Weights are copied into one `nn.Linear` for `forward` / `predict_proba`.  
    - **Hyperparameters (PCA dim + `C`)**: maximised **validation AUROC** within each fold; for the final full-data fit (no held-out val in `solution.py`), **mean AUROC across inner stratified CV folds** on the training matrix.  
    - **Threshold**: `fit_hyperparameters` maximises **validation accuracy**; ties broken by **balanced accuracy**.
 
 3. **Splits (`split_data`)**  
-   - **StratifiedKFold (`n_splits=5`)**.  
+   - **StratifiedKFold (n_splits=5)**.  
    - Validation fraction within the non-test pool scaled so validation size is ~15% of the full dataset in intent.
 
 ### What helped the metric most
 
 - **Tail-focused pooling** (weighted mean, suffix mean over late tokens, last-token contrasts) targets the assistant’s answer span rather than the whole prompt.  
-- **PCA + linear logistic probe** (with **`C` grid**) lowers effective dimensionality vs raw 10754-d features and tends to generalise better than a high-dimensional linear model on small `N`.  
-- **Validation AUROC** for picking PCA/`C` stabilises ranking quality; **threshold** tuning on validation **accuracy** aligns decisions with the leaderboard metric (accuracy on `test.csv`).  
+- **PCA + linear logistic probe** (with **C grid**) lowers effective dimensionality vs raw 10754-d features and tends to generalise better than a high-dimensional linear model on small `N`.  
+- **Validation AUROC** for picking PCA/C stabilises ranking quality; **threshold** tuning on validation **accuracy** aligns decisions with the leaderboard metric (accuracy on `test.csv`).  
 
 ### Local evaluation snapshot (`results.json`)
 
@@ -124,5 +124,5 @@ The table is **cross-validation on `dataset.csv`**.
 | **Very deep MLP / very long training** | Risk of overfitting; superseded by **PCA + logistic** probe. |
 | **Deep MLP + Adam** | Replaced by **PCA + sklearn `LogisticRegression`** mapped to `nn.Linear`. |
 | **`max` pool over sequence** | Replaced by **mean over last ~30% of real tokens** — aligns with answer-heavy tail. |
-| **Selecting PCA/`C` by validation accuracy** (instead of AUROC) | Tried to match the accuracy leaderboard directly; on our CV runs **mean test accuracy / AUROC did not improve**, so the repo **reverted** to **AUROC-based** selection for PCA/`C`. |
+| **Selecting PCA/`C` by validation accuracy** (instead of AUROC) | Tried to match the accuracy leaderboard directly; on our CV runs **mean test accuracy / AUROC did not improve**, so the repo **reverted** to **AUROC-based** selection for PCA/C. |
 
