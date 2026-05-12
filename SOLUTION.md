@@ -123,6 +123,6 @@ The table is **cross-validation on `dataset.csv`**.
 | **`USE_GEOMETRIC = True`** | Optional path in `aggregation.py` not enabled in `solution.py`; main signal kept in `aggregate()`. |
 | **Very deep MLP / very long training** | Risk of overfitting; superseded by **PCA + logistic** probe. |
 | **Deep MLP + Adam** | Replaced by **PCA + sklearn `LogisticRegression`** mapped to `nn.Linear`. |
-| **`max` pool over sequence** | Replaced by **mean over last ~30% of real tokens** — aligns with answer-heavy tail. |
-| **Selecting PCA/`C` by validation accuracy** (instead of AUROC) | Tried to match the accuracy leaderboard directly; on our CV runs **mean test accuracy / AUROC did not improve**, so the repo **reverted** to **AUROC-based** selection for PCA/C. |
+| **max pool over sequence** | Replaced by **mean over last ~30% of real tokens** — aligns with answer-heavy tail. |
+| **Selecting PCA/C by validation accuracy** (instead of AUROC) | Tried to match the accuracy leaderboard directly; on our CV runs **mean test accuracy / AUROC did not improve**, so the repo **reverted** to **AUROC-based** selection for PCA/C. |
 
